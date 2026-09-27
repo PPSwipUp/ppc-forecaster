@@ -1,0 +1,9 @@
+ppc_rs/target/
+dist/
+target/
+*.so
+*.pyd
+__pycache__/
+.venv/
+bench_data/
+.pytest_cache/
