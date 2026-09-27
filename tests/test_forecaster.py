@@ -72,7 +72,9 @@ def test_cli_train_update_report(tmp_path):
     df = synthetic(1500)
     df.iloc[:1000].to_csv(tmp_path / "a.csv", index=False)
     df.iloc[1000:].to_csv(tmp_path / "b.csv", index=False)
-    run = lambda *a: subprocess.run([sys.executable, "-m", "ppc.cli", *a], capture_output=True, text=True)
+    # run from tmp_path so `-m ppc.cli` imports the installed package, not a source checkout in the cwd
+    run = lambda *a: subprocess.run([sys.executable, "-m", "ppc.cli", *a], capture_output=True, text=True,
+                                    cwd=tmp_path)
     r = run("train", str(tmp_path / "a.csv"), "--target", "y", "--time", "time", "--horizons", "1",
             "--season", "24", "--exog", "all", "--save", str(tmp_path / "m.ppc"))
     assert r.returncode == 0, r.stderr
