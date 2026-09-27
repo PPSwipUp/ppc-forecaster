@@ -1,5 +1,9 @@
 # ppc-forecaster
 
+[![PyPI](https://img.shields.io/pypi/v/ppc-forecaster)](https://pypi.org/project/ppc-forecaster/)
+[![CI](https://github.com/PPSwipUp/ppc-forecaster/actions/workflows/CI.yml/badge.svg)](https://github.com/PPSwipUp/ppc-forecaster/actions/workflows/CI.yml)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/PPSwipUp/ppc-forecaster/blob/main/notebooks/quickstart.ipynb)
+
 A time-series forecaster that **keeps learning while it runs**. Point it at a CSV or a live feed and pick
 what to predict. It forecasts every row before seeing the answer, learns from each answer as it arrives,
 and tells you honestly whether it beats simple baselines on *your* data.
@@ -16,6 +20,19 @@ pip install ppc-forecaster
 
 Prebuilt wheels are published for Linux (x86_64, aarch64), macOS (Intel, Apple Silicon) and Windows
 (x64), for Python 3.9 and later. On other platforms pip builds from source, which needs a Rust toolchain.
+
+**Try it in your browser:** the [quickstart notebook](notebooks/quickstart.ipynb) (click the Colab badge) forecasts
+London's weather and improves a professional weather forecast, in about two minutes.
+
+## Examples
+
+| script | what it shows |
+|---|---|
+| [`examples/weather_bias_correction.py`](examples/weather_bias_correction.py) | improve a weather model's 24 h forecast for any lat/lon by learning its local errors |
+| [`examples/home_energy.py`](examples/home_energy.py) | a household's electricity use, 1 h and 1 day ahead |
+| [`examples/website_traffic.py`](examples/website_traffic.py) | daily Wikipedia page views; shows `auto` falling back to "no change" when the learners lose |
+
+Run them from the repository root: `python examples/home_energy.py` (they download public data on first run).
 
 ## Command line
 
@@ -74,6 +91,11 @@ Average absolute error in the second half of each dataset (lower is better):
   `--base` it learns its local biases online.
 
 Reproduce with `python -m experiments.forecast_bench` from the source repository.
+
+**Against other libraries** ([full results](benchmarks/RESULTS.md)). Univariate, with River tuned and ppc on defaults:
+- **1 hour ahead:** ppc is best or tied on all three datasets (bike rentals: 40 vs River's best 46.5).
+- **24 hours ahead:** ppc is best on temperature and household power. statsforecast MSTL, with an explicit weekly
+  season, beats it on bike rentals (60.8 vs 77.6).
 
 ## Limits
 
