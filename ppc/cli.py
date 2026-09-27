@@ -1,7 +1,8 @@
 """ppc -- command-line forecaster that keeps learning.
 
-  ppc train  data.csv --target temp [--time time] [--horizons 1,24] [--season 24] [--exog all|a,b]
-                      [--base 24:nwp_col] [--save model.ppc] [--out forecasts.csv]
+  ppc train  data.csv --target temp [--time time] [--horizons 1,24] [--season 24,168] [--exog all|a,b]
+                      [--base 24:nwp_col] [--transform auto|log|none] [--interval 0.8]
+                      [--save model.ppc] [--out forecasts.csv]
       Streams the whole file through every model (each forecast made before its answer is seen),
       prints an honest score table against persistence / seasonal-naive / linear baselines,
       and optionally saves the model and the forecasts.  --base gives it an existing forecast to improve.
@@ -27,8 +28,11 @@ def _table(f):
     R = f.report()
     pd.set_option("display.width", 200)
     cols = ["horizon", "model", "MAE_all", "RMSE_all", "skill_all", "MAE_2nd_half", "skill_2nd_half"]
-    print(R[cols].round(4).to_string(index=False))
+    cols += [c for c in ("coverage_2nd_half", "width_2nd_half") if c in R]
+    print(R[cols].round(4).to_string(index=False, na_rep=""))
     print("\nskill = 1 - MAE / MAE(persistence): >0 beats 'no change', higher is better.")
+    if "coverage_2nd_half" in R:
+        print(f"coverage = share of values inside auto's {f.interval:.0%} prediction interval (should be ~{f.interval:.0%}).")
     for h in f.horizons:
         r = R[R.horizon == h].set_index("model")
         best = r.MAE_2nd_half.idxmin()
@@ -44,9 +48,12 @@ def main(argv=None):
     t.add_argument("--target", required=True)
     t.add_argument("--time")
     t.add_argument("--horizons", default="1")
-    t.add_argument("--season", type=int)
+    t.add_argument("--season", default="", help="seasonal cycle length(s) in rows, e.g. 24 or 24,168")
     t.add_argument("--exog", default="", help="'all' for every other numeric column, or a,b,c")
     t.add_argument("--neurons", type=int, default=128)
+    t.add_argument("--transform", default="auto", choices=["auto", "log", "none"],
+                   help="auto: learn on log(1+y) for skewed non-negative targets (default)")
+    t.add_argument("--interval", type=float, default=0.8, help="prediction-interval level, 0 to turn off")
     t.add_argument("--base", default="", help="existing forecast to improve, as H:column (row t = its forecast for t+H)")
     t.add_argument("--save")
     t.add_argument("--out")
@@ -80,10 +87,18 @@ def main(argv=None):
             if col not in df or int(h) not in hs:
                 sys.exit(f"error: --base {item}: need H in --horizons and an existing column")
             base[int(h)] = col
-        f = Forecaster(horizons=hs, season=a.season, n_neurons=a.neurons, base=base)
+        try:
+            seasons = [int(x) for x in a.season.split(",") if x]
+        except ValueError:
+            sys.exit(f"error: --season must be whole numbers like 24 or 24,168, got '{a.season}'")
+        if not 0 <= a.interval < 1:
+            sys.exit("error: --interval must be between 0 and 1 (e.g. 0.8), or 0 to turn off")
+        f = Forecaster(horizons=hs, season=seasons or None, n_neurons=a.neurons, base=base,
+                       transform=a.transform, interval=a.interval or None)
         t0 = time.time()
         P = f.fit_predict(df, target=a.target, time=a.time, exog=exog)
-        print(f"{len(df)} rows, {len(exog)} exogenous columns, horizons {hs}, {time.time() - t0:.1f}s\n")
+        print(f"{len(df)} rows, {len(exog)} exogenous columns, horizons {hs}, "
+              f"{'log' if f.use_log else 'raw'} scale, {time.time() - t0:.1f}s\n")
         _table(f)
         if a.out:
             P.to_csv(a.out, index=False)
@@ -96,7 +111,8 @@ def main(argv=None):
         if f.time:
             df = df.sort_values(f.time, kind="stable")
         P = f.update(df)
-        cols = (["time"] if "time" in P else []) + ["y"] + [f"auto_h{h}" for h in f.horizons]
+        cols = (["time"] if "time" in P else []) + ["y"] + [c for h in f.horizons for c in
+                                                             (f"auto_h{h}", f"auto_h{h}_lo", f"auto_h{h}_hi") if c in P]
         print(P[cols].tail(10).to_string(index=False))
         if a.out:
             P.to_csv(a.out, index=False)

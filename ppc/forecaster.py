@@ -1,7 +1,7 @@
 """Forecaster: point the PPC brain at a time series and it keeps learning as rows arrive.
 
     from ppc.forecaster import Forecaster
-    f = Forecaster(horizons=(1, 24), season=24)
+    f = Forecaster(horizons=(1, 24), season=[24, 168])          # daily + weekly cycles
     pred = f.fit_predict(df, target="temp", time="time", exog=["pressure", "wind"])   # every row, prequential
     print(f.report())                        # honest scores vs persistence / seasonal-naive / linear
     f.save("model.ppc")
@@ -17,11 +17,16 @@ Models run side by side on the same features:
   brain        PPC recurrent network (Rust engine), RLS readout
   linear       the same readout with no network (online recursive least squares on the features)
   persistence  y[t+h] = y[t]
-  seasonal     y[t+h] = y[t+h-season]            (only if season >= h)
+  seasonal     y[t+h] = y[t+h-s] for the first season s >= h;  seasonal<s> for each further season
   base         an existing forecast you supply (base={h: column}, the column's row t = its forecast for t+h)
   auto         at each row, whichever of the above has the lowest recent error (known errors only)
 The brain and linear models predict the correction to a starting forecast: the supplied base forecast if
 given (so they learn its biases online, "model output statistics"), else persistence y[t].
+
+transform="auto" learns on log(1 + y) when the target is non-negative and strongly skewed (counts, sales,
+page views), decided from the first rows only; forecasts are always returned in the original units.
+interval=0.8 adds auto_h<H>_lo / _hi: an 80% prediction interval from the recent errors of the auto
+forecast (online conformal), with its real coverage shown by report().
 """
 from __future__ import annotations
 
@@ -48,16 +53,37 @@ def _roll(y, w, fn):
     return getattr(s, fn)().values
 
 
+def _shift(y, k):
+    """value k rows earlier (k > 0) or later (k < 0), NaN where it does not exist"""
+    out = np.full(len(y), np.nan)
+    if k > 0:
+        out[k:] = y[:-k]
+    elif k < 0:
+        out[:k] = y[-k:]
+    else:
+        out[:] = y
+    return out
+
+
 class Forecaster:
     def __init__(self, horizons=(1,), season=None, lags=None, windows=None, n_neurons=128, seed=0,
-                 auto_halflife=500, rls_halflife=200_000.0, base=None):
+                 auto_halflife=500, rls_halflife=200_000.0, base=None, transform="auto", interval=0.8,
+                 interval_window=1000):
         self.horizons = tuple(int(h) for h in horizons)
-        self.season = season
-        self.lags = tuple(lags) if lags else tuple(sorted({1, 2, 3, 6, 12, *( [season, 2 * season] if season else [24])}))
-        self.windows = tuple(windows) if windows else (6, 24) if not season else (max(2, season // 4), season)
+        seasons = [] if season is None else [season] if np.isscalar(season) else list(season)
+        self.seasons = sorted(int(s) for s in seasons)
+        self.season = self.seasons[0] if self.seasons else None
+        extra = [k for s in self.seasons for k in (s, 2 * s)] or [24]
+        self.lags = tuple(lags) if lags else tuple(sorted({1, 2, 3, 6, 12, *extra}))
+        self.windows = (tuple(windows) if windows else
+                        (6, 24) if not self.seasons else tuple(sorted({max(2, self.seasons[0] // 4), *self.seasons})))
         self.n_neurons, self.seed = n_neurons, seed
         self.base = {int(h): c for h, c in (base or {}).items()}
         self.auto_halflife, self.rls_halflife = auto_halflife, rls_halflife
+        assert transform in ("auto", "log", None, "none")
+        self.transform = None if transform == "none" else transform
+        self.use_log = False
+        self.interval, self.interval_window = interval, interval_window
         self.brains = None
         self.target = self.time = None
         self.exog = []
@@ -65,14 +91,50 @@ class Forecaster:
         self.hist = None                         # tail of past rows needed to continue
         self.ewma = None                         # recent |error| per horizon/model for "auto"
         self.pending = []                        # forecasts made but not yet scored (for auto after resume)
+        self.resid, self.pend_int = {}, {}       # interval state: recent residuals, unscored auto forecasts
         self.log = None                          # full prequential log (for report)
 
+    def __setstate__(self, st):                  # models saved by 0.1.x lack the newer settings
+        self.__dict__.update(st)
+        s = self.__dict__
+        s.setdefault("seasons", [s["season"]] if s.get("season") else [])
+        s.setdefault("transform", None)
+        s.setdefault("use_log", False)
+        s.setdefault("interval", None)
+        s.setdefault("interval_window", 1000)
+        s.setdefault("resid", {})
+        s.setdefault("pend_int", {})
+
+    # ---------------------------------------------------------------- transform
+    def _fwd(self, v):
+        return np.log1p(np.maximum(v, 0.0)) if self.use_log else v
+
+    def _inv(self, v):
+        return np.expm1(v) if self.use_log else v
+
+    def _decide_transform(self, y):
+        if self.transform == "log":
+            return True
+        if self.transform != "auto":
+            return False
+        head = y[:max(200, len(y) // 10)]
+        head = head[np.isfinite(head)]
+        if len(head) < 50 or head.min() < 0 or head.std() == 0:
+            return False
+        skew = ((head - head.mean()) ** 3).mean() / head.std() ** 3
+        return bool(skew > 1.0)
+
     # ---------------------------------------------------------------- features
-    def _features(self, y, t, E):
-        cols = [y]
-        cols += [_lagdiff(y, k) for k in self.lags]
+    def _features(self, z, t, E):
+        cols = [z]
+        cols += [_lagdiff(z, k) for k in self.lags]
         for w in self.windows:
-            cols += [_roll(y, w, "mean") - y, _roll(y, w, "std")]
+            cols += [_roll(z, w, "mean") - z, _roll(z, w, "std")]
+        # the value one season before each target, relative to now: z[t+h-s] - z[t]
+        for h in self.horizons:
+            for s in self.seasons:
+                if s >= h:
+                    cols.append(_shift(z, s - h) - z)
         if t is not None:
             ts = pd.DatetimeIndex(t)
             for per, v in ((24, ts.hour + ts.minute / 60), (7, ts.dayofweek), (365.25, ts.dayofyear)):
@@ -81,19 +143,19 @@ class Forecaster:
             cols += [E[:, j], _lagdiff(E[:, j], 1)]            # (flag columns just get a harmless diff)
         return np.nan_to_num(np.column_stack(cols).astype(float))
 
-    def _start(self, y, B, h):
-        """starting forecast for y[t+h] made at t: the supplied base forecast (if finite) else y[t]"""
+    def _start(self, z, B, h):
+        """starting forecast (model space) for y[t+h] made at t: the base forecast if finite, else z[t]"""
         if h in self.base:
             b = B[self.base[h]]
-            return np.where(np.isfinite(b), b, y)
-        return y
+            return np.where(np.isfinite(b), b, z)
+        return z
 
-    def _labels(self, y, B):
+    def _labels(self, z, B):
         out = {}
         for h in self.horizons:
-            s0 = self._start(y, B, h)
-            lab = np.full(len(y), np.nan)
-            lab[h:] = y[h:] - s0[:-h]              # at row t: truth minus the start made h rows ago
+            s0 = self._start(z, B, h)
+            lab = np.full(len(z), np.nan)
+            lab[h:] = z[h:] - s0[:-h]              # at row t: truth minus the start made h rows ago
             out[f"d{h}"] = lab[:, None]
         return out
 
@@ -120,14 +182,18 @@ class Forecaster:
         return y, t, np.column_stack([E, *flags]) if flags else E
 
     # ---------------------------------------------------------------- run
+    def _seasonal_names(self, h):
+        return [("seasonal" if i == 0 else f"seasonal{s}", s) for i, s in enumerate(self.seasons) if s >= h]
+
     def _run(self, df_all, n_new):
         """df_all = kept history + new rows; learn/predict on the last n_new rows"""
         y, t, E = self._prep(df_all)
-        B = {c: pd.to_numeric(df_all[c], errors="coerce").values.astype(float) for c in self.base.values()}
-        X = self._features(y, t, E)
-        for h, c in self.base.items():             # the correction model sees the base forecast relative to y[t]
-            X = np.column_stack([X, np.nan_to_num(B[c] - y), np.isfinite(B[c]).astype(float)])
-        lab = self._labels(y, B)
+        z = self._fwd(y)
+        B = {c: self._fwd(pd.to_numeric(df_all[c], errors="coerce").values.astype(float)) for c in self.base.values()}
+        X = self._features(z, t, E)
+        for h, c in self.base.items():             # the correction model sees the base forecast relative to now
+            X = np.column_stack([X, np.nan_to_num(B[c] - z), np.isfinite(B[c]).astype(float)])
+        lab = self._labels(z, B)
         new = slice(len(y) - n_new, len(y))
         if self.brains is None:
             self.brains = self._new_brains(X.shape[1])
@@ -139,24 +205,25 @@ class Forecaster:
         if t is not None:
             res["time"] = t[new]
         for h in self.horizons:
-            s0 = self._start(y, B, h)[new]
+            s0 = self._start(z, B, h)[new]
             for m in MODELS:
-                res[f"{m}_h{h}"] = s0 + outs[m][f"d{h}"][:, 0]
+                res[f"{m}_h{h}"] = self._inv(s0 + outs[m][f"d{h}"][:, 0])
             res[f"persistence_h{h}"] = yn
             if h in self.base:
-                res[f"base_h{h}"] = B[self.base[h]][new]
-            if self.season and self.season >= h:
-                idx = np.arange(len(y))[new] + h - self.season
-                res[f"seasonal_h{h}"] = np.where(idx >= 0, y[np.maximum(idx, 0)], np.nan)
+                res[f"base_h{h}"] = self._inv(B[self.base[h]][new])
+            for name, s in self._seasonal_names(h):
+                res[f"{name}_h{h}"] = _shift(y, s - h)[new]
         P = pd.DataFrame(res)
         self._auto(P, y, new)
-        keep = max(max(self.lags), max(self.windows), max(self.horizons), self.season or 0) + 2
+        if self.interval:
+            self._intervals(P, yn)
+        keep = max(max(self.lags), max(self.windows), max(self.horizons), max(self.seasons, default=0)) + 2
         self.hist = df_all.iloc[-keep:].copy()
         return P
 
     def _cands(self, h):
-        return [m for m in (*MODELS, "persistence", "seasonal", "base")
-                if (m != "seasonal" or (self.season and self.season >= h)) and (m != "base" or h in self.base)]
+        out = [*MODELS, "persistence"] + [n for n, _ in self._seasonal_names(h)]
+        return out + (["base"] if h in self.base else [])
 
     def _auto(self, P, y, new):
         """auto_h: at each row use the model with the lowest EWMA |error| among errors already known"""
@@ -193,10 +260,29 @@ class Forecaster:
         self.pending = [(h, np.column_stack([P[f"{m}_h{h}"].values for m in self._cands(h)])[-h:])
                         for h in self.horizons]
 
+    def _intervals(self, P, yn):
+        """auto_h<H>_lo/_hi from the empirical quantiles of the auto forecast's recent errors (y - forecast),
+        using only errors already known at each row (the forecast for row r was made h rows earlier)."""
+        n, W = len(P), self.interval_window
+        qlo, qhi = (1 - self.interval) / 2, (1 + self.interval) / 2
+        for h in self.horizons:
+            f = P[f"auto_h{h}"].values
+            prev = self.pend_int.get(h, np.zeros(0))
+            prev = np.concatenate([np.full(h - len(prev), np.nan), prev])          # forecasts for rows 0..h-1
+            fx = np.concatenate([prev, f])                                         # fx[r] = forecast for new row r
+            e_new = yn - fx[:n]                                                    # realised at row r
+            e_all = np.concatenate([self.resid.get(h, np.zeros(0)), e_new])
+            r = pd.Series(e_all).rolling(W, min_periods=30)
+            lo, hi = r.quantile(qlo).values[-n:], r.quantile(qhi).values[-n:]
+            P[f"auto_h{h}_lo"], P[f"auto_h{h}_hi"] = f + lo, f + hi
+            self.resid[h] = e_all[-W:]
+            self.pend_int[h] = fx[-h:]
+
     def fit_predict(self, df, target, time=None, exog=None):
         self.target, self.time = target, time
         self.exog = [c for c in (exog or []) if c != target and c != time]
         self.miss = {c: bool(pd.to_numeric(df[c], errors="coerce").isna().any()) for c in self.exog}
+        self.use_log = self._decide_transform(pd.to_numeric(df[target], errors="coerce").values.astype(float))
         P = self._run(df.reset_index(drop=True), len(df))
         self.log = P
         return P
@@ -214,7 +300,8 @@ class Forecaster:
     def report(self, P=None, warmup=0.1):
         """MAE / RMSE per horizon and model, scored against the value h rows later; skill = 1 - MAE/MAE(persistence).
         Rows in the first `warmup` fraction are skipped (every model is still learning there); the
-        second-half columns show whether the ranking holds up later."""
+        second-half columns show whether the ranking holds up later.  For `auto`, coverage_2nd_half is how
+        often the truth actually fell inside the prediction interval (should be close to `interval`)."""
         P = self.log if P is None else P
         y = P.y.values
         n = len(y)
@@ -230,6 +317,12 @@ class Forecaster:
                     e = e[np.isfinite(e)]
                     r[f"MAE_{part}"] = np.abs(e).mean()
                     r[f"RMSE_{part}"] = np.sqrt((e ** 2).mean())
+                if m == "auto" and f"auto_h{h}_lo" in P:
+                    lo, hi = P[f"auto_h{h}_lo"].values[n // 2:], P[f"auto_h{h}_hi"].values[n // 2:]
+                    tt = truth[n // 2:]
+                    ok = np.isfinite(lo) & np.isfinite(hi) & np.isfinite(tt)
+                    r["coverage_2nd_half"] = ((tt[ok] >= lo[ok]) & (tt[ok] <= hi[ok])).mean()
+                    r["width_2nd_half"] = (hi[ok] - lo[ok]).mean()
                 rows.append(r)
         R = pd.DataFrame(rows)
         for part in ("all", "2nd_half"):

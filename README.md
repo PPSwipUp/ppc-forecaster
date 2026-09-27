@@ -38,7 +38,7 @@ Run them from the repository root: `python examples/home_energy.py` (they downlo
 
 ```bash
 # stream a file through every model, print an honest score table, save the model
-ppc train weather.csv --target temperature --time time --horizons 1,24 --season 24 --exog all --save temp.ppc
+ppc train weather.csv --target temperature --time time --horizons 1,24 --season 24,168 --exog all --save temp.ppc
 
 # later: feed new rows, get forecasts, keep learning
 ppc update temp.ppc new_rows.csv --out forecasts.csv
@@ -54,9 +54,9 @@ import pandas as pd
 from ppc.forecaster import Forecaster
 
 df = pd.read_csv("weather.csv")
-f = Forecaster(horizons=(1, 24), season=24)
+f = Forecaster(horizons=(1, 24), season=[24, 168])      # daily + weekly cycles
 pred = f.fit_predict(df, target="temperature", time="time", exog=["pressure", "wind"])
-print(f.report())          # MAE / RMSE and skill vs persistence, for every model and horizon
+print(f.report())          # MAE / RMSE, skill vs persistence, interval coverage
 f.save("temp.ppc")
 
 f = Forecaster.load("temp.ppc")
@@ -64,7 +64,14 @@ new_pred = f.update(new_rows)   # continues exactly where it stopped
 ```
 
 Output columns: `<model>_h<H>` is that model's forecast, made on that row, for the value H rows later.
-The models are `brain`, `linear`, `persistence`, `seasonal`, `base` (if given) and `auto`.
+The models are `brain`, `linear`, `persistence`, `seasonal` (plus `seasonal<s>` for extra seasons), `base`
+(if given) and `auto`. `auto_h<H>_lo` / `_hi` give an 80% prediction interval (`interval=0.8`; `None` turns it off).
+
+**Useful options**
+- `season=[24, 168]` sets several cycles (in rows).
+- `transform="auto"` (the default) learns on a log scale for skewed, non-negative data like counts or sales;
+  `"log"` or `None` force it.
+- `base={24: "col"}` gives it an existing forecast to improve.
 
 ## How it is scored
 
@@ -74,28 +81,29 @@ Skill = 1 − MAE / MAE(persistence), where persistence means "no change".
 
 ## Benchmarks (honest)
 
-Average absolute error in the second half of each dataset (lower is better):
+Average absolute error on held-out data (lower is better), `season=[24, 168]`, no extra inputs:
 
 | data | ahead | brain | linear | no change |
 |---|---|---|---|---|
-| London temperature (°C), 2016–2025 | 1 h | **0.37** | 0.41 | 0.65 |
-| | 24 h | 2.06 | **1.90** | 2.10 |
-| Bike-share rentals per hour (UCI) | 1 h | **41** | 59 | 80 |
-| | 24 h | 82 | **76** | 78 |
-| Household power, kW (UCI) | 1 h | **0.395** | 0.399 | 0.414 |
-| London wind 24 h, correcting a professional weather forecast | 24 h | 1.90 | **1.84** | 4.63 (professional forecast alone: 1.99) |
+| London temperature (°C), 2016–2025 | 1 h | **0.388** | 0.393 | 0.653 |
+| | next 24 h | 1.460 | **1.368** | 1.747 |
+| Bike-share rentals per hour (UCI) | 1 h | **32.2** | 34.0 | 79.8 |
+| | next 24 h | 63.9 | **60.6** | 170.7 |
+| Household power, kW (UCI) | 1 h | **0.361** | 0.365 | 0.414 |
+| London wind, correcting a professional weather forecast | 24 h | 1.95 | **1.84** | 4.63 (professional forecast alone: 1.99) |
 
 - **The brain shines at short horizons** where inputs interact (bike demand by hour and working day).
 - **At 24 h+ a linear model usually wins.** `auto` picks per horizon for you.
 - **From history alone it will not beat a physics-based weather model**, but given that forecast with
   `--base` it learns its local biases online.
 
-Reproduce with `python -m experiments.forecast_bench` from the source repository.
+Reproduce with `python benchmarks/compare.py` and `python -m experiments.forecast_bench` from the source repository.
 
-**Against other libraries** ([full results](benchmarks/RESULTS.md)). Univariate, with River tuned and ppc on defaults:
-- **1 hour ahead:** ppc is best or tied on all three datasets (bike rentals: 40 vs River's best 46.5).
-- **24 hours ahead:** ppc is best on temperature and household power. statsforecast MSTL, with an explicit weekly
-  season, beats it on bike rentals (60.8 vs 77.6).
+**Against other libraries** ([full results](benchmarks/RESULTS.md)). Univariate, River tuned, ppc on defaults:
+- **1 hour ahead:** ppc is best on all three datasets, 7–31% below the best River model.
+- **24 hours ahead:** ppc beats statsforecast MSTL on temperature (−12%) and household power (−11%) and ties it
+  on bike rentals.
+- **Its 80% prediction intervals held 79–80% of actual values.**
 
 ## Limits
 

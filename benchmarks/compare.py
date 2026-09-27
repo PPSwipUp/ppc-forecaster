@@ -6,7 +6,7 @@ same regular hourly series.  No exogenous inputs for anyone.
 
 Task A  one step ahead, every hour (prequential: forecast, then learn).  Scored on the second half.
         ppc (brain / linear / auto), River SNARIMAX, River Holt-Winters, River linear regression on lags
-        (River's settings tuned on the first half; ppc uses its defaults),
+        (River's settings tuned on the first half; ppc uses defaults with season=[24, 168]),
         naive (last value), seasonal naive (same hour yesterday).
         statsforecast is left out here: it re-fits a batch model, and doing that every hour is not practical.
 Task B  day-ahead: at 00:00 each day forecast the next 24 hours, for the last DAYS days.
@@ -154,8 +154,11 @@ def main():
 
         # ppc
         t0 = time.time()
-        f = Forecaster(horizons=range(1, 25), season=24)
+        f = Forecaster(horizons=range(1, 25), season=[24, 168])       # daily + weekly cycles, auto transform
         P = f.fit_predict(df, target="y", time="time")
+        R = f.report().set_index(["horizon", "model"])
+        print(f"  {label}: ppc {'log' if f.use_log else 'raw'} scale, 80% interval coverage "
+              f"h1 {R.loc[(1, 'auto'), 'coverage_2nd_half']:.3f} h24 {R.loc[(24, 'auto'), 'coverage_2nd_half']:.3f}", flush=True)
         for m in ("brain", "linear", "auto"):
             fc_day = np.stack([[P[f"{m}_h{h}"].values[o] for h in range(1, 25)] for o in mids])
             rows.append({"data": label, "method": f"ppc {m}", "one_step_MAE": mae(P[f"{m}_h1"].values[half:-1], truth_one[half:-1]),

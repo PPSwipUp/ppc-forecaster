@@ -6,6 +6,6 @@ from _fetch import household_power
 from ppc.forecaster import Forecaster
 
 df = household_power()
-f = Forecaster(horizons=(1, 24), season=24)
+f = Forecaster(horizons=(1, 24), season=[24, 168])     # daily + weekly cycles
 f.fit_predict(df, target="kw", time="time")
 print(f.report()[["horizon", "model", "MAE_2nd_half", "skill_2nd_half"]].round(3).to_string(index=False))
