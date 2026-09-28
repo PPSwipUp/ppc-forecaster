@@ -1,0 +1,12 @@
+{
+  "domain": "ppc_forecaster",
+  "name": "PPC Forecaster",
+  "codeowners": ["@PPSwipUp"],
+  "dependencies": ["recorder"],
+  "documentation": "https://github.com/PPSwipUp/ppc-forecaster/blob/main/custom_components/ppc_forecaster/README.md",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/PPSwipUp/ppc-forecaster/issues",
+  "requirements": ["ppc-forecaster>=0.3.0"],
+  "version": "0.3.0"
+}
