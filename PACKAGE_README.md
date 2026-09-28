@@ -31,6 +31,7 @@ London's weather and improves a professional weather forecast, in about two minu
 | [`examples/weather_bias_correction.py`](examples/weather_bias_correction.py) | improve a weather model's 24 h forecast for any lat/lon by learning its local errors |
 | [`examples/home_energy.py`](examples/home_energy.py) | a household's electricity use, 1 h and 1 day ahead |
 | [`examples/website_traffic.py`](examples/website_traffic.py) | daily Wikipedia page views; shows `auto` falling back to "no change" when the learners lose |
+| [`examples/many_cities.py`](examples/many_cities.py) | ten cities' temperature at once with `PanelForecaster` (about 10 s) |
 
 Run them from the repository root: `python examples/home_energy.py` (they download public data on first run).
 
@@ -45,6 +46,9 @@ ppc update temp.ppc new_rows.csv --out forecasts.csv
 
 # improve an existing forecast: column `nwp24` holds, on row t, someone else's forecast for t+24
 ppc train weather.csv --target wind --time time --horizons 24 --base 24:nwp24
+
+# many series in one file (one model per store, run in parallel); --fast for big jobs
+ppc train sales.csv --target sales --time date --id store --horizons 1,7 --season 7 --fast
 ```
 
 ## Python
@@ -72,6 +76,24 @@ The models are `brain`, `linear`, `persistence`, `seasonal` (plus `seasonal<s>` 
 - `transform="auto"` (the default) learns on a log scale for skewed, non-negative data like counts or sales;
   `"log"` or `None` force it.
 - `base={24: "col"}` gives it an existing forecast to improve.
+- `fast=True` runs the brain only for horizons up to 6 (the linear model covers longer ones, where it usually
+  wins anyway): 2.6–2.8× faster with the same day-ahead accuracy on the benchmarks.
+
+**Many series at once** (every store, sensor or city): one model per series, run in parallel, nothing pooled.
+
+```python
+from ppc import PanelForecaster
+pf = PanelForecaster(id_col="store", horizons=(1, 7), season=[7], fast=True)
+pred = pf.fit_predict(df, target="sales", time="date")   # all stores stacked in one frame
+pf.report()                    # per model: mean skill across series and how many series it won
+pred_new = pf.update(new_rows) # known stores continue; new stores get a new model
+```
+
+## Home Assistant
+
+A custom integration in [`custom_components/ppc_forecaster`](custom_components/ppc_forecaster/README.md) adds
+forecast sensors (with an 80% range) for any sensor Home Assistant keeps statistics for: power, energy,
+temperature. It trains on your history at startup and keeps learning every hour.
 
 ## How it is scored
 

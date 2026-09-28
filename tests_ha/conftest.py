@@ -1,4 +1,7 @@
 import os
+# import pandas before the test clock is frozen: first imported while freezegun has replaced `datetime`, pandas 3 on
+# Python 3.13 crashes the interpreter (stack overflow in the garbage collector, in pandas' NaT, a datetime subclass)
+import pandas  # noqa: F401
 
 # The repo root is deliberately NOT put on sys.path: `ppc` must come from the installed wheel (with its compiled
 # engine), not from this source folder.  Run with the `pytest` command (not `python -m pytest`, which adds the cwd).

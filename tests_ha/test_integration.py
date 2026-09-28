@@ -61,6 +61,9 @@ async def setup(hass):
 @pytest.mark.parametrize("expected_lingering_timers", [True])
 async def test_forecast_sensors(recorder_mock, enable_custom_integrations, hass, expected_lingering_timers, freezer):
     use_our_custom_components()
+    path = hass.config.path(".storage", "ppc_forecaster.sensor_test_power.pkl")
+    if os.path.exists(path):                               # the harness's config folder outlives each run
+        os.remove(path)
     now = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
     freezer.move_to(now + timedelta(minutes=20))
     start = now - timedelta(days=60)
@@ -89,11 +92,13 @@ async def test_forecast_sensors(recorder_mock, enable_custom_integrations, hass,
     await async_wait_recording_done(hass)
     freezer.move_to(now + timedelta(hours=1, minutes=15))
     async_fire_time_changed(hass, now + timedelta(hours=1, minutes=15))
-    await setup(hass)
+    for _ in range(20):                                    # statistics load in the recorder's own executor
+        await setup(hass)
+        if hass.states.get("sensor.test_power_forecast_1h").attributes["for_time"] != first_for:
+            break
     assert hub.runner.last_time == now
     s1b = hass.states.get("sensor.test_power_forecast_1h")
     assert s1b.attributes["for_time"] == (now + timedelta(hours=1)).isoformat()
     assert s1b.attributes["for_time"] != first_for
 
-    path = hass.config.path(".storage", "ppc_forecaster.sensor_test_power.pkl")
     assert os.path.exists(path), "model was not saved"
