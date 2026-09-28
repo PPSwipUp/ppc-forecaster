@@ -68,7 +68,9 @@ def _shift(y, k):
 class Forecaster:
     def __init__(self, horizons=(1,), season=None, lags=None, windows=None, n_neurons=128, seed=0,
                  auto_halflife=500, rls_halflife=200_000.0, base=None, transform="auto", interval=0.8,
-                 interval_window=1000):
+                 interval_window=1000, brain_max_horizon=None, fast=False):
+        """fast=True: the brain (the slow part) only forecasts horizons up to 6 steps, where it wins;
+        longer horizons use the linear model and baselines.  Same as brain_max_horizon=6."""
         self.horizons = tuple(int(h) for h in horizons)
         seasons = [] if season is None else [season] if np.isscalar(season) else list(season)
         self.seasons = sorted(int(s) for s in seasons)
@@ -84,6 +86,7 @@ class Forecaster:
         self.transform = None if transform == "none" else transform
         self.use_log = False
         self.interval, self.interval_window = interval, interval_window
+        self.brain_max_horizon = 6 if fast and brain_max_horizon is None else brain_max_horizon
         self.brains = None
         self.target = self.time = None
         self.exog = []
@@ -104,6 +107,7 @@ class Forecaster:
         s.setdefault("interval_window", 1000)
         s.setdefault("resid", {})
         s.setdefault("pend_int", {})
+        s.setdefault("brain_max_horizon", None)
 
     # ---------------------------------------------------------------- transform
     def _fwd(self, v):
@@ -159,13 +163,21 @@ class Forecaster:
             out[f"d{h}"] = lab[:, None]
         return out
 
+    def _model_horizons(self, m):
+        if m == "brain" and self.brain_max_horizon is not None:
+            return [h for h in self.horizons if h <= self.brain_max_horizon]
+        return list(self.horizons)
+
+    def _models(self):
+        return [m for m in MODELS if self._model_horizons(m)]
+
     def _new_brains(self, D):
+        from .rust import RustBrain
         out = {}
-        for m in MODELS:
+        for m in self._models():
             heads = [PredictHead(f"d{h}", delay=h, lr=0.01, solver="rls", rls_halflife=self.rls_halflife)
-                     for h in self.horizons]
+                     for h in self._model_horizons(m)]
             n = self.n_neurons if m == "brain" else 0
-            from .rust import RustBrain
             out[m] = RustBrain.from_numpy(Brain(D, heads, n_neurons=n, seed=self.seed), seed=self.seed + 1)
         return out
 
@@ -197,17 +209,19 @@ class Forecaster:
         new = slice(len(y) - n_new, len(y))
         if self.brains is None:
             self.brains = self._new_brains(X.shape[1])
-        with ThreadPoolExecutor(len(MODELS)) as ex:          # Rust releases the GIL: models run in parallel
-            outs = dict(zip(MODELS, ex.map(lambda m: self.brains[m].run(X[new], {k: v[new] for k, v in lab.items()}),
-                                           MODELS)))
+        models = list(self.brains)
+        with ThreadPoolExecutor(len(models)) as ex:          # Rust releases the GIL: models run in parallel
+            outs = dict(zip(models, ex.map(lambda m: self.brains[m].run(
+                X[new], {k: v[new] for k, v in lab.items() if k in self.brains[m].heads}), models)))
         yn = y[new]
         res = {"y": yn}
         if t is not None:
             res["time"] = t[new]
         for h in self.horizons:
             s0 = self._start(z, B, h)[new]
-            for m in MODELS:
-                res[f"{m}_h{h}"] = self._inv(s0 + outs[m][f"d{h}"][:, 0])
+            for m in outs:
+                if f"d{h}" in outs[m]:
+                    res[f"{m}_h{h}"] = self._inv(s0 + outs[m][f"d{h}"][:, 0])
             res[f"persistence_h{h}"] = yn
             if h in self.base:
                 res[f"base_h{h}"] = self._inv(B[self.base[h]][new])
@@ -222,43 +236,38 @@ class Forecaster:
         return P
 
     def _cands(self, h):
-        out = [*MODELS, "persistence"] + [n for n, _ in self._seasonal_names(h)]
+        out = [m for m in MODELS if h in self._model_horizons(m)] + ["persistence"]
+        out += [n for n, _ in self._seasonal_names(h)]
         return out + (["base"] if h in self.base else [])
 
     def _auto(self, P, y, new):
-        """auto_h: at each row use the model with the lowest EWMA |error| among errors already known"""
-        a = 0.5 ** (1 / self.auto_halflife)
+        """auto_h: at each row use the model with the lowest EWMA |error| among errors already known.
+        The forecast for row i was made at row i-h, so its error is known at row i (vectorised, exact)."""
+        alpha = 1 - 0.5 ** (1 / self.auto_halflife)
         if self.ewma is None:
             self.ewma = {h: {m: np.nan for m in self._cands(h)} for h in self.horizons}
             self.pending = []
-        # pending forecasts from an earlier call, plus this call's, resolved in time order
-        rows = len(P)
+        prev_all = dict(self.pending)
+        yn = y[new]
+        n = len(P)
+        pend = []
         for h in self.horizons:
             cands = self._cands(h)
             F = np.column_stack([P[f"{m}_h{h}"].values for m in cands])
-            prev = [p for p in self.pending if p[0] == h]
-            choice = np.empty(rows)
-            for i in range(rows):
-                # resolve forecasts whose target is row i (made at row i-h)
-                j = i - h
-                if j >= 0:
-                    f = F[j]
-                elif prev and len(prev[0][1]) >= -j:
-                    f = prev[0][1][j]
-                else:
-                    f = None
-                if f is not None:
-                    for k, m in enumerate(cands):
-                        e = abs(f[k] - y[new][i])
-                        if np.isfinite(e):
-                            o = self.ewma[h][m]
-                            self.ewma[h][m] = e if np.isnan(o) else a * o + (1 - a) * e
-                scores = [self.ewma[h][m] for m in cands]
-                k = int(np.nanargmin(scores)) if np.isfinite(scores).any() else cands.index("persistence")
-                choice[i] = F[i, k]
-            P[f"auto_h{h}"] = choice
-        self.pending = [(h, np.column_stack([P[f"{m}_h{h}"].values for m in self._cands(h)])[-h:])
-                        for h in self.horizons]
+            prev = prev_all.get(h, np.zeros((0, len(cands))))
+            prev = np.vstack([np.full((h - len(prev), len(cands)), np.nan), prev]) if len(prev) < h else prev[-h:]
+            Fx = np.vstack([prev, F])                                    # Fx[i] = forecasts for new row i
+            err = np.abs(Fx[:n] - yn[:, None])
+            state = np.array([[self.ewma[h].get(m, np.nan) for m in cands]])
+            E = pd.DataFrame(np.vstack([state, err])).ewm(alpha=alpha, adjust=False, ignore_na=True).mean().values
+            # ewm fills rows before a column's first value with NaN, as intended; drop the state row
+            E = E[1:]
+            k = np.where(np.isfinite(E).any(1), np.argmin(np.where(np.isfinite(E), E, np.inf), 1),
+                         cands.index("persistence"))
+            P[f"auto_h{h}"] = F[np.arange(n), k]
+            self.ewma[h] = {m: E[-1, j] if n else state[0, j] for j, m in enumerate(cands)}
+            pend.append((h, Fx[-h:]))
+        self.pending = pend
 
     def _intervals(self, P, yn):
         """auto_h<H>_lo/_hi from the empirical quantiles of the auto forecast's recent errors (y - forecast),

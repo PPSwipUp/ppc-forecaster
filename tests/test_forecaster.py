@@ -48,6 +48,28 @@ def test_save_and_resume_is_exact(tmp_path):
         np.testing.assert_allclose(part[c].values, full[c].values[1500:], atol=1e-9)
 
 
+def test_resume_with_fewer_rows_than_the_horizon(tmp_path):
+    """updates smaller than the horizon (e.g. one new row an hour, 24 h ahead) must match a single run"""
+    df = synthetic(1300)
+    full = Forecaster(horizons=(1, 6), season=24).fit_predict(df, target="y", time="time")
+    f = Forecaster(horizons=(1, 6), season=24)
+    parts = [f.fit_predict(df.iloc[:1200], target="y", time="time")]
+    for i in range(1200, 1300, 2):                             # two rows at a time, horizon 6
+        parts.append(f.update(df.iloc[i:i + 2]))
+    part = pd.concat(parts, ignore_index=True)
+    for c in ("auto_h1", "auto_h6", "auto_h6_lo", "brain_h6"):
+        np.testing.assert_allclose(part[c].values, full[c].values, atol=1e-9)
+
+
+def test_fast_mode_skips_brain_on_long_horizons():
+    df = synthetic(2000)
+    f = Forecaster(horizons=(1, 24), season=24, fast=True)
+    P = f.fit_predict(df, target="y", time="time")
+    assert "brain_h1" in P and "brain_h24" not in P and "linear_h24" in P
+    R = f.report().set_index(["horizon", "model"])
+    assert (24, "brain") not in R.index and R.loc[(24, "auto"), "skill_2nd_half"] > 0
+
+
 def test_base_forecast_is_used():
     """given a near-perfect base forecast, the corrected models should be about as good as it"""
     df = synthetic(3000)
@@ -128,6 +150,41 @@ def test_models_saved_by_0_1_still_load(tmp_path):
     assert len(P) == 200 and np.isfinite(P.auto_h1).all()
 
 
+def panel_df(k=5, n=1500):
+    parts = []
+    for i in range(k):
+        d = synthetic(n, seed=i)
+        d["y"] = d.y * (i + 1) + 10 * i                          # different scales per series
+        parts.append(d.assign(store=f"s{i}"))
+    return pd.concat(parts, ignore_index=True).sample(frac=1, random_state=0)   # rows in any order
+
+
+def test_panel_matches_separate_models_and_resumes(tmp_path):
+    from ppc.panel import PanelForecaster
+    df = panel_df()
+    pf = PanelForecaster("store", horizons=(1, 6), season=24)
+    P = pf.fit_predict(df, target="y", time="time", exog=["x"])
+    assert set(P.store) == {f"s{i}" for i in range(5)} and len(P) == len(df)
+    one = Forecaster(horizons=(1, 6), season=24).fit_predict(
+        df[df.store == "s3"].sort_values("time").drop(columns="store"), target="y", time="time", exog=["x"])
+    np.testing.assert_allclose(P[P.store == "s3"].auto_h6.values, one.auto_h6.values, atol=1e-9)
+    A = pf.report()
+    for h in (1, 6):                                           # exactly one winner per series and horizon
+        assert A[(A.horizon == h) & (A.model != "auto")].wins.sum() == 5
+    assert (A[(A.model == "auto")].skill_2nd_half > 0.3).all()
+    # resume + a brand-new series
+    first = df[df.time < "2024-02-20"]
+    later = pd.concat([df[df.time >= "2024-02-20"], synthetic(300).assign(store="new")])
+    pf2 = PanelForecaster("store", horizons=(1, 6), season=24)
+    pf2.fit_predict(first, target="y", time="time", exog=["x"])
+    pf2.save(tmp_path / "p.ppc")
+    Q = PanelForecaster.load(tmp_path / "p.ppc").update(later)
+    assert "new" in set(Q.store)
+    a = P[(P.store == "s1")].set_index("time").auto_h1
+    b = Q[(Q.store == "s1")].set_index("time").auto_h1
+    np.testing.assert_allclose(b.values, a.loc[b.index].values, atol=1e-9)
+
+
 def test_cli_train_update_report(tmp_path):
     df = synthetic(1500)
     df.iloc[:1000].to_csv(tmp_path / "a.csv", index=False)
@@ -136,7 +193,7 @@ def test_cli_train_update_report(tmp_path):
     run = lambda *a: subprocess.run([sys.executable, "-m", "ppc.cli", *a], capture_output=True, text=True,
                                     cwd=tmp_path)
     r = run("train", str(tmp_path / "a.csv"), "--target", "y", "--time", "time", "--horizons", "1",
-            "--season", "24,168", "--exog", "all", "--save", str(tmp_path / "m.ppc"))
+            "--season", "24,168", "--exog", "all", "--fast", "--save", str(tmp_path / "m.ppc"))
     assert r.returncode == 0, r.stderr
     assert "persistence" in r.stdout and "coverage" in r.stdout
     r = run("update", str(tmp_path / "m.ppc"), str(tmp_path / "b.csv"), "--out", str(tmp_path / "p.csv"))
@@ -148,6 +205,13 @@ def test_cli_train_update_report(tmp_path):
     assert r.returncode != 0 and "not in" in r.stderr
     r = run("train", str(tmp_path / "a.csv"), "--target", "y", "--season", "day")
     assert r.returncode != 0 and "--season" in r.stderr
+    panel_df(3, 600).to_csv(tmp_path / "panel.csv", index=False)
+    r = run("train", str(tmp_path / "panel.csv"), "--target", "y", "--time", "time", "--id", "store",
+            "--season", "24", "--fast", "--save", str(tmp_path / "pm.ppc"))
+    assert r.returncode == 0, r.stderr
+    assert "3 series" in r.stdout and "wins" in r.stdout
+    r = run("update", str(tmp_path / "pm.ppc"), str(tmp_path / "panel.csv"))
+    assert r.returncode == 0, r.stderr
 
 
 if __name__ == "__main__":
