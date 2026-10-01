@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ppc-forecaster"
-version = "0.3.0"
+version = "0.3.1"
 description = "A forecaster that keeps learning as data arrives: a plastic recurrent network (Rust) with honest built-in baselines"
 readme = "PACKAGE_README.md"
 license = { text = "MIT" }

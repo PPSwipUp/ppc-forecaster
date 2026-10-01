@@ -108,6 +108,8 @@ class Forecaster:
         s.setdefault("resid", {})
         s.setdefault("pend_int", {})
         s.setdefault("brain_max_horizon", None)
+        if s.get("ewma") is not None and "ewma_w" not in s:     # saved before 0.3.1: treat as fully warmed up
+            s["ewma_w"] = {h: {m: float(np.isfinite(v)) for m, v in d.items()} for h, d in s["ewma"].items()}
 
     # ---------------------------------------------------------------- transform
     def _fwd(self, v):
@@ -242,10 +244,13 @@ class Forecaster:
 
     def _auto(self, P, y, new):
         """auto_h: at each row use the model with the lowest EWMA |error| among errors already known.
-        The forecast for row i was made at row i-h, so its error is known at row i (vectorised, exact)."""
+        The forecast for row i was made at row i-h, so its error is known at row i (vectorised, exact).
+        The average is bias-corrected (weighted sum / sum of weights), so the first errors don't dominate it
+        for hundreds of rows on short series."""
         alpha = 1 - 0.5 ** (1 / self.auto_halflife)
         if self.ewma is None:
             self.ewma = {h: {m: np.nan for m in self._cands(h)} for h in self.horizons}
+            self.ewma_w = {h: {m: 0.0 for m in self._cands(h)} for h in self.horizons}
             self.pending = []
         prev_all = dict(self.pending)
         yn = y[new]
@@ -258,14 +263,20 @@ class Forecaster:
             prev = np.vstack([np.full((h - len(prev), len(cands)), np.nan), prev]) if len(prev) < h else prev[-h:]
             Fx = np.vstack([prev, F])                                    # Fx[i] = forecasts for new row i
             err = np.abs(Fx[:n] - yn[:, None])
-            state = np.array([[self.ewma[h].get(m, np.nan) for m in cands]])
-            E = pd.DataFrame(np.vstack([state, err])).ewm(alpha=alpha, adjust=False, ignore_na=True).mean().values
-            # ewm fills rows before a column's first value with NaN, as intended; drop the state row
-            E = E[1:]
+            # carried state: weighted error sum (as an average) and the weight it represents, starting at 0 / 0
+            w0 = np.array([[self.ewma_w[h].get(m, 0.0) for m in cands]])
+            s0 = np.nan_to_num(np.array([[self.ewma[h].get(m, np.nan) for m in cands]])) * w0
+            ew = lambda X: pd.DataFrame(X).ewm(alpha=alpha, adjust=False, ignore_na=True).mean().values[1:]
+            Sx = ew(np.vstack([s0, err]))                                # sum(weights * error)
+            Wx = ew(np.vstack([w0, np.where(np.isfinite(err), 1.0, np.nan)]))  # sum(weights)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                E = np.where(Wx > 0, Sx / Wx, np.nan)
             k = np.where(np.isfinite(E).any(1), np.argmin(np.where(np.isfinite(E), E, np.inf), 1),
                          cands.index("persistence"))
             P[f"auto_h{h}"] = F[np.arange(n), k]
-            self.ewma[h] = {m: E[-1, j] if n else state[0, j] for j, m in enumerate(cands)}
+            if n:
+                self.ewma[h] = {m: E[-1, j] for j, m in enumerate(cands)}
+                self.ewma_w[h] = {m: Wx[-1, j] for j, m in enumerate(cands)}
             pend.append((h, Fx[-h:]))
         self.pending = pend
 
